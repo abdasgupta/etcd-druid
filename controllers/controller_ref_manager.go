@@ -31,6 +31,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
+	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
 	"github.com/gardener/etcd-druid/pkg/common"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -155,7 +156,8 @@ func (m *BaseControllerRefManager) claimObject(obj metav1.Object, match func(met
 type EtcdDruidRefManager struct {
 	BaseControllerRefManager
 	controllerKind schema.GroupVersionKind
-	reconciler     *EtcdReconciler
+	cl             client.Client
+	scheme         *runtime.Scheme
 }
 
 // NewEtcdDruidRefManager returns a EtcdDruidRefManager that exposes
@@ -166,7 +168,8 @@ type EtcdDruidRefManager struct {
 // It will only be called (at most once) if an adoption is actually attempted.
 // If CanAdopt() returns a non-nil error, all adoptions will fail.
 func NewEtcdDruidRefManager(
-	reconciler *EtcdReconciler,
+	cl client.Client,
+	scheme *runtime.Scheme,
 	controller metav1.Object,
 	selector labels.Selector,
 	controllerKind schema.GroupVersionKind,
@@ -179,8 +182,37 @@ func NewEtcdDruidRefManager(
 			CanAdoptFunc: canAdopt,
 		},
 		controllerKind: controllerKind,
-		reconciler:     reconciler,
+		cl:             cl,
+		scheme:         scheme,
 	}
+}
+
+// FetchStatefulSet fetches statefulset based on ETCD resource
+func (m *EtcdDruidRefManager) FetchStatefulSet(etcd *druidv1alpha1.Etcd) ([]*appsv1.StatefulSet, error) {
+	selector, err := metav1.LabelSelectorAsSelector(etcd.Spec.Selector)
+	if err != nil {
+		logger.Error(err, "Error converting etcd selector to selector")
+		return nil, err
+	}
+
+	// list all statefulsets to include the statefulsets that don't match the etcd`s selector
+	// anymore but has the stale controller ref.
+	statefulSets := &appsv1.StatefulSetList{}
+	err = m.cl.List(context.TODO(), statefulSets, client.InNamespace(etcd.Namespace), client.MatchingLabelsSelector{Selector: selector})
+	if err != nil {
+		logger.Error(err, "Error listing statefulsets")
+		return nil, err
+	}
+
+	// NOTE: filteredStatefulSets are pointing to deepcopies of the cache, but this could change in the future.
+	// Ref: https://github.com/kubernetes-sigs/controller-runtime/blob/release-0.2/pkg/cache/internal/cache_reader.go#L74
+	// if you need to modify them, you need to copy it first.
+	filteredStatefulSets, err := m.ClaimStatefulsets(statefulSets)
+	if err != nil {
+		return nil, err
+	}
+
+	return filteredStatefulSets, err
 }
 
 // ClaimStatefulsets tries to take ownership of a list of Statefulsets.
@@ -350,21 +382,21 @@ func (m *EtcdDruidRefManager) AdoptResource(obj metav1.Object) error {
 		clone = obj.(*corev1.ConfigMap).DeepCopy()
 		// Note that ValidateOwnerReferences() will reject this patch if another
 		// OwnerReference exists with controller=true.
-		if err := controllerutil.SetControllerReference(m.Controller, clone, m.reconciler.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(m.Controller, clone, m.scheme); err != nil {
 			return err
 		}
 	case *corev1.Service:
 		clone = obj.(*corev1.Service).DeepCopy()
 		// Note that ValidateOwnerReferences() will reject this patch if another
 		// OwnerReference exists with controller=true.
-		if err := controllerutil.SetControllerReference(m.Controller, clone, m.reconciler.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(m.Controller, clone, m.scheme); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("cannot adopt resource: %s", objType)
 	}
 
-	return m.reconciler.Patch(context.TODO(), clone.(runtime.Object), client.MergeFrom(obj.(runtime.Object)))
+	return m.cl.Patch(context.TODO(), clone.(runtime.Object), client.MergeFrom(obj.(runtime.Object)))
 }
 
 // ReleaseResource sends a patch to free the resource from the control of the controller.
@@ -389,7 +421,7 @@ func (m *EtcdDruidRefManager) ReleaseResource(obj metav1.Object) error {
 
 	m.disown(clone)
 
-	err := client.IgnoreNotFound(m.reconciler.Patch(context.TODO(), clone.(runtime.Object), client.MergeFrom(obj.(runtime.Object))))
+	err := client.IgnoreNotFound(m.cl.Patch(context.TODO(), clone.(runtime.Object), client.MergeFrom(obj.(runtime.Object))))
 	if errors.IsInvalid(err) {
 		// Invalid error will be returned in two cases: 1. the etcd
 		// has no owner reference, 2. the uid of the etcd doesn't
